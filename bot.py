@@ -2,16 +2,16 @@ import logging
 import sqlite3
 import os
 from datetime import datetime, timedelta
-from flask import Flask, request, render_template_string, make_response
+from flask import Flask, request, make_response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import threading
+import io
 
 # --- الإعدادات ---
 TOKEN = "8783824232:AAH4c9SK5pZM3NoBgoN6QkXD5Z_frxGqANg"
 ADMIN_ID = 8395932049
 DB_NAME = "bot_database.db"
-# ملاحظة: يجب تغيير هذا الرابط بعد رفع البوت على الاستضافة
 BASE_URL = os.environ.get('BASE_URL', 'https://your-app-name.onrender.com')
 
 # --- قاعدة البيانات ---
@@ -29,7 +29,6 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO settings VALUES ('price_day', '10.0')")
     c.execute("INSERT OR IGNORE INTO settings VALUES ('price_month', '200.0')")
     
-    # تعيين الأدمن
     c.execute("INSERT OR IGNORE INTO users (telegram_id, username, is_admin) VALUES (?, ?, ?)", (ADMIN_ID, 'Admin', 1))
     conn.commit()
     conn.close()
@@ -49,9 +48,7 @@ def serve_subdomain(subdomain):
     
     if result:
         html_content, end_date = result
-        # التحقق من الصلاحية
         if datetime.strptime(end_date, '%Y-%m-%d %H:%M:%S') > datetime.now():
-            # إرجاع الكود كـ HTML حقيقي ليتم تشغيله في المتصفح بشكل عام
             response = make_response(html_content)
             response.headers['Content-Type'] = 'text/html; charset=utf-8'
             return response
@@ -88,7 +85,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("⚙️ لوحة التحكم (أدمن)", callback_data='admin_panel')])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"مرحباً {username}! في بوت تأجير النطاقات.\nاختر من القائمة:", reply_markup=reply_markup)
+    await update.message.reply_text(f"مرحباً {username}! في بوت تأجير النطاقات.\nيمكنك الآن إرسال كود HTML كنص أو رفع ملف .html مباشرة.", reply_markup=reply_markup)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -126,6 +123,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("أرسل ID المستخدم متبوعاً بالمبلغ، مثال:\n`12345678 50`")
         context.user_data['state'] = 'admin_adding_balance'
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get('state')
+    if state == 'awaiting_html':
+        doc = update.message.document
+        if doc.file_name.endswith('.html') or doc.file_name.endswith('.txt'):
+            file = await context.bot.get_file(doc.file_id)
+            content = await file.download_as_bytearray()
+            html_text = content.decode('utf-8')
+            
+            context.user_data['html'] = html_text
+            keyboard = [
+                [InlineKeyboardButton("ساعة (1$)", callback_data='period_hour')],
+                [InlineKeyboardButton("يوم (10$)", callback_data='period_day')],
+                [InlineKeyboardButton("شهر (200$)", callback_data='period_month')]
+            ]
+            await update.message.reply_text("✅ تم استلام الملف بنجاح! اختر مدة التأجير:", reply_markup=InlineKeyboardMarkup(keyboard))
+            context.user_data['state'] = 'awaiting_period'
+        else:
+            await update.message.reply_text("❌ عذراً، يجب أن يكون الملف بصيغة .html أو .txt")
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state')
     user_id = update.effective_user.id
@@ -141,7 +158,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if c.rowcount > 0:
                 conn.commit()
                 await update.message.reply_text(f"✅ تم إضافة {amount}$ لحساب المستخدم {target_id}")
-                # إشعار المستخدم
                 try:
                     await context.bot.send_message(chat_id=int(target_id), text=f"💰 تم إضافة {amount}$ إلى رصيدك من قبل الإدارة!")
                 except: pass
@@ -161,7 +177,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             context.user_data['subdomain'] = text
             context.user_data['state'] = 'awaiting_html'
-            await update.message.reply_text(f"✅ النطاق {text} متاح!\nالآن أرسل كود HTML بالكامل:")
+            await update.message.reply_text(f"✅ النطاق {text} متاح!\nالآن أرسل كود HTML كنص أو قم برفع ملف .html:")
         conn.close()
 
     elif state == 'awaiting_html':
@@ -171,7 +187,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("يوم (10$)", callback_data='period_day')],
             [InlineKeyboardButton("شهر (200$)", callback_data='period_month')]
         ]
-        await update.message.reply_text("اختر مدة التأجير:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text("✅ تم استلام الكود! اختر مدة التأجير:", reply_markup=InlineKeyboardMarkup(keyboard))
         context.user_data['state'] = 'awaiting_period'
 
 async def period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -180,13 +196,11 @@ async def period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     period_type = query.data.split('_')[1]
     
-    # جلب الأسعار
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("SELECT value FROM settings WHERE key = ?", (f'price_{period_type}',))
     price = float(c.fetchone()[0])
     
-    # التحقق من الرصيد
     c.execute("SELECT balance, id FROM users WHERE telegram_id = ?", (user_id,))
     user_data = c.fetchone()
     balance, u_id = user_data[0], user_data[1]
@@ -205,7 +219,6 @@ async def period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else: end_date = now + timedelta(days=30)
     
     try:
-        # خصم الرصيد وتسجيل النطاق
         c.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (price, u_id))
         c.execute("INSERT INTO rentals (user_id, subdomain, html_content, end_date, status) VALUES (?, ?, ?, ?, ?)",
                   (u_id, subdomain, html, end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active'))
@@ -223,6 +236,7 @@ if __name__ == '__main__':
     app_bot.add_handler(CommandHandler("start", start))
     app_bot.add_handler(CallbackQueryHandler(button_handler, pattern='^(rent_new|my_account|admin_panel|admin_add_balance)$'))
     app_bot.add_handler(CallbackQueryHandler(period_selection, pattern='^period_'))
+    app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app_bot.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
     
     print("Bot is running...")
