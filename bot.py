@@ -2,7 +2,7 @@ import logging
 import sqlite3
 import os
 from datetime import datetime, timedelta
-from flask import Flask, request, render_template_string, abort
+from flask import Flask, request, render_template_string, make_response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import threading
@@ -11,7 +11,8 @@ import threading
 TOKEN = "8783824232:AAH4c9SK5pZM3NoBgoN6QkXD5Z_frxGqANg"
 ADMIN_ID = 8395932049
 DB_NAME = "bot_database.db"
-BASE_URL = "https://your-app-name.onrender.com"  # سيتم تحديثه لاحقاً
+# ملاحظة: يجب تغيير هذا الرابط بعد رفع البوت على الاستضافة
+BASE_URL = os.environ.get('BASE_URL', 'https://your-app-name.onrender.com')
 
 # --- قاعدة البيانات ---
 def init_db():
@@ -24,14 +25,12 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS settings 
                  (key TEXT PRIMARY KEY, value TEXT)''')
     
-    # إعدادات افتراضية
     c.execute("INSERT OR IGNORE INTO settings VALUES ('price_hour', '1.0')")
     c.execute("INSERT OR IGNORE INTO settings VALUES ('price_day', '10.0')")
     c.execute("INSERT OR IGNORE INTO settings VALUES ('price_month', '200.0')")
     
     # تعيين الأدمن
     c.execute("INSERT OR IGNORE INTO users (telegram_id, username, is_admin) VALUES (?, ?, ?)", (ADMIN_ID, 'Admin', 1))
-    
     conn.commit()
     conn.close()
 
@@ -50,34 +49,46 @@ def serve_subdomain(subdomain):
     
     if result:
         html_content, end_date = result
+        # التحقق من الصلاحية
         if datetime.strptime(end_date, '%Y-%m-%d %H:%M:%S') > datetime.now():
-            return render_template_string(html_content)
+            # إرجاع الكود كـ HTML حقيقي ليتم تشغيله في المتصفح بشكل عام
+            response = make_response(html_content)
+            response.headers['Content-Type'] = 'text/html; charset=utf-8'
+            return response
         else:
-            return "<h1>هذا النطاق انتهت صلاحيته</h1>", 403
+            return "<h1>عذراً، انتهت صلاحية هذا النطاق</h1>", 403
     return "<h1>النطاق غير موجود</h1>", 404
 
 @app.route('/')
 def index():
-    return "Bot is running!"
+    return "<h1>Bot is active and serving domains!</h1>"
 
 def run_flask():
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 
 # --- بوت تليجرام ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    username = update.effective_user.username or "User"
+    
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (telegram_id, username) VALUES (?, ?)", (user_id, username))
+    conn.commit()
+    conn.close()
+
     keyboard = [
         [InlineKeyboardButton("🌐 تأجير نطاق جديد", callback_data='rent_new')],
         [InlineKeyboardButton("👤 حسابي", callback_data='my_account')],
-        [InlineKeyboardButton("💰 شحن الرصيد", callback_data='top_up')]
     ]
     if user_id == ADMIN_ID:
-        keyboard.append([InlineKeyboardButton("⚙️ لوحة التحكم", callback_data='admin_panel')])
+        keyboard.append([InlineKeyboardButton("⚙️ لوحة التحكم (أدمن)", callback_data='admin_panel')])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("مرحباً بك في بوت تأجير النطاقات! اختر من القائمة أدناه:", reply_markup=reply_markup)
+    await update.message.reply_text(f"مرحباً {username}! في بوت تأجير النطاقات.\nاختر من القائمة:", reply_markup=reply_markup)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -85,7 +96,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if query.data == 'rent_new':
-        await query.edit_message_text("من فضلك أرسل اسم النطاق المطلوب (أحرف إنجليزية فقط):")
+        await query.edit_message_text("أرسل اسم النطاق المطلوب (أحرف إنجليزية فقط):")
         context.user_data['state'] = 'awaiting_subdomain'
     
     elif query.data == 'my_account':
@@ -97,34 +108,60 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rentals = c.fetchall()
         conn.close()
         
-        msg = f"👤 حسابك:\nالرصيد: {balance}$\n\nنطاقاتك:\n"
+        msg = f"👤 حسابك:\n💰 الرصيد الحالي: {balance}$\n\nنطاقاتك النشطة:\n"
+        if not rentals:
+            msg += "لا يوجد لديك نطاقات حالياً."
         for r in rentals:
-            msg += f"- {r[0]} (ينتهي في: {r[1]})\n"
+            msg += f"- {BASE_URL}/s/{r[0]} (ينتهي: {r[1]})\n"
         await query.edit_message_text(msg)
 
     elif query.data == 'admin_panel' and user_id == ADMIN_ID:
         keyboard = [
-            [InlineKeyboardButton("💵 تعديل الأسعار", callback_data='edit_prices')],
-            [InlineKeyboardButton("📊 إحصائيات", callback_data='stats')]
+            [InlineKeyboardButton("➕ إضافة رصيد لمستخدم", callback_data='admin_add_balance')],
+            [InlineKeyboardButton("📊 إحصائيات عامة", callback_data='admin_stats')]
         ]
         await query.edit_message_text("لوحة تحكم المسؤول:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif query.data == 'admin_add_balance' and user_id == ADMIN_ID:
+        await query.edit_message_text("أرسل ID المستخدم متبوعاً بالمبلغ، مثال:\n`12345678 50`")
+        context.user_data['state'] = 'admin_adding_balance'
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state')
     user_id = update.effective_user.id
     text = update.message.text
 
-    if state == 'awaiting_subdomain':
-        # التحقق من توفر النطاق
+    if state == 'admin_adding_balance' and user_id == ADMIN_ID:
+        try:
+            target_id, amount = text.split()
+            amount = float(amount)
+            conn = sqlite3.connect(DB_NAME)
+            c = conn.cursor()
+            c.execute("UPDATE users SET balance = balance + ? WHERE telegram_id = ?", (amount, target_id))
+            if c.rowcount > 0:
+                conn.commit()
+                await update.message.reply_text(f"✅ تم إضافة {amount}$ لحساب المستخدم {target_id}")
+                # إشعار المستخدم
+                try:
+                    await context.bot.send_message(chat_id=int(target_id), text=f"💰 تم إضافة {amount}$ إلى رصيدك من قبل الإدارة!")
+                except: pass
+            else:
+                await update.message.reply_text("❌ لم يتم العثور على المستخدم.")
+            conn.close()
+        except:
+            await update.message.reply_text("❌ خطأ في التنسيق. أرسل: ID المبلغ")
+        context.user_data['state'] = None
+
+    elif state == 'awaiting_subdomain':
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
         c.execute("SELECT id FROM rentals WHERE subdomain = ?", (text,))
         if c.fetchone():
-            await update.message.reply_text("عذراً، هذا النطاق محجوز بالفعل. اختر اسماً آخر:")
+            await update.message.reply_text("❌ هذا النطاق محجوز. اختر اسماً آخر:")
         else:
             context.user_data['subdomain'] = text
             context.user_data['state'] = 'awaiting_html'
-            await update.message.reply_text(f"النطاق {text} متاح! الآن أرسل كود HTML الذي تريد تشغيله:")
+            await update.message.reply_text(f"✅ النطاق {text} متاح!\nالآن أرسل كود HTML بالكامل:")
         conn.close()
 
     elif state == 'awaiting_html':
@@ -143,40 +180,50 @@ async def period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     period_type = query.data.split('_')[1]
     
+    # جلب الأسعار
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key = ?", (f'price_{period_type}',))
+    price = float(c.fetchone()[0])
+    
+    # التحقق من الرصيد
+    c.execute("SELECT balance, id FROM users WHERE telegram_id = ?", (user_id,))
+    user_data = c.fetchone()
+    balance, u_id = user_data[0], user_data[1]
+    
+    if balance < price:
+        await query.edit_message_text(f"❌ رصيدك غير كافٍ. السعر: {price}$ ورصيدك: {balance}$\nتواصل مع الإدارة لشحن الرصيد.")
+        conn.close()
+        return
+
     subdomain = context.user_data.get('subdomain')
     html = context.user_data.get('html')
     
-    # حساب تاريخ الانتهاء
     now = datetime.now()
     if period_type == 'hour': end_date = now + timedelta(hours=1)
     elif period_type == 'day': end_date = now + timedelta(days=1)
     else: end_date = now + timedelta(days=30)
     
-    # حفظ في قاعدة البيانات (تبسيط: الرصيد مجاني حالياً كما طلب المستخدم)
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE telegram_id = ?", (user_id,))
-    u_id = c.fetchone()[0]
     try:
+        # خصم الرصيد وتسجيل النطاق
+        c.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (price, u_id))
         c.execute("INSERT INTO rentals (user_id, subdomain, html_content, end_date, status) VALUES (?, ?, ?, ?, ?)",
                   (u_id, subdomain, html, end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active'))
         conn.commit()
         url = f"{BASE_URL}/s/{subdomain}"
-        await query.edit_message_text(f"✅ تم تفعيل النطاق بنجاح!\nالرابط: {url}\nينتهي في: {end_date}")
+        await query.edit_message_text(f"✅ تم التفعيل بنجاح!\n🔗 الرابط: {url}\n📅 ينتهي في: {end_date.strftime('%Y-%m-%d %H:%M')}")
     except Exception as e:
         await query.edit_message_text(f"❌ حدث خطأ: {str(e)}")
     conn.close()
 
 if __name__ == '__main__':
-    # تشغيل Flask في خيط منفصل
     threading.Thread(target=run_flask, daemon=True).start()
     
-    # تشغيل البوت
     app_bot = ApplicationBuilder().token(TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start))
-    app_bot.add_handler(CallbackQueryHandler(button_handler, pattern='^(rent_new|my_account|top_up|admin_panel)$'))
+    app_bot.add_handler(CallbackQueryHandler(button_handler, pattern='^(rent_new|my_account|admin_panel|admin_add_balance)$'))
     app_bot.add_handler(CallbackQueryHandler(period_selection, pattern='^period_'))
     app_bot.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
     
-    print("Bot and Server are starting...")
+    print("Bot is running...")
     app_bot.run_polling()
