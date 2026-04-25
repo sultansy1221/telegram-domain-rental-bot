@@ -12,7 +12,9 @@ import io
 TOKEN = "8783824232:AAH4c9SK5pZM3NoBgoN6QkXD5Z_frxGqANg"
 ADMIN_ID = 8395932049
 DB_NAME = "bot_database.db"
-BASE_URL = os.environ.get('BASE_URL', 'https://your-app-name.onrender.com')
+# محاولة جلب الرابط تلقائياً من Render أو استخدام متغير البيئة
+RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL')
+BASE_URL = os.environ.get('BASE_URL', RENDER_EXTERNAL_URL if RENDER_EXTERNAL_URL else 'https://your-app-name.onrender.com')
 
 # --- قاعدة البيانات ---
 def init_db():
