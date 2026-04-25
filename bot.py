@@ -6,12 +6,12 @@ from flask import Flask, request, make_response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import threading
-import io
 
 # --- الإعدادات ---
 TOKEN = "8783824232:AAH4c9SK5pZM3NoBgoN6QkXD5Z_frxGqANg"
 ADMIN_ID = 8395932049
 DB_NAME = "bot_database.db"
+
 # محاولة جلب الرابط تلقائياً من Render أو استخدام متغير البيئة
 RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL')
 BASE_URL = os.environ.get('BASE_URL', RENDER_EXTERNAL_URL if RENDER_EXTERNAL_URL else 'https://your-app-name.onrender.com')
@@ -129,10 +129,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state')
     if state == 'awaiting_html':
         doc = update.message.document
-        if doc.file_name.endswith('.html') or doc.file_name.endswith('.txt'):
+        # التعرف التلقائي على ملفات HTML أو النصية
+        if doc.file_name.lower().endswith(('.html', '.htm', '.txt')):
             file = await context.bot.get_file(doc.file_id)
-            content = await file.download_as_bytearray()
-            html_text = content.decode('utf-8')
+            # تحميل الملف وقراءته
+            file_content = await file.download_as_bytearray()
+            try:
+                html_text = file_content.decode('utf-8')
+            except UnicodeDecodeError:
+                # محاولة فك التشفير بتنسيقات أخرى إذا فشل utf-8
+                html_text = file_content.decode('latin-1')
             
             context.user_data['html'] = html_text
             keyboard = [
@@ -140,10 +146,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("يوم (10$)", callback_data='period_day')],
                 [InlineKeyboardButton("شهر (200$)", callback_data='period_month')]
             ]
-            await update.message.reply_text("✅ تم استلام الملف بنجاح! اختر مدة التأجير:", reply_markup=InlineKeyboardMarkup(keyboard))
+            await update.message.reply_text(f"✅ تم التعرف على الملف '{doc.file_name}' بنجاح!\nاختر مدة التأجير:", reply_markup=InlineKeyboardMarkup(keyboard))
             context.user_data['state'] = 'awaiting_period'
         else:
-            await update.message.reply_text("❌ عذراً، يجب أن يكون الملف بصيغة .html أو .txt")
+            await update.message.reply_text("❌ عذراً، يجب أن يكون الملف بصيغة .html لكي أتمكن من تشغيله.")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state')
@@ -152,8 +158,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == 'admin_adding_balance' and user_id == ADMIN_ID:
         try:
-            target_id, amount = text.split()
-            amount = float(amount)
+            parts = text.split()
+            target_id = parts[0]
+            amount = float(parts[1])
             conn = sqlite3.connect(DB_NAME)
             c = conn.cursor()
             c.execute("UPDATE users SET balance = balance + ? WHERE telegram_id = ?", (amount, target_id))
@@ -164,22 +171,28 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id=int(target_id), text=f"💰 تم إضافة {amount}$ إلى رصيدك من قبل الإدارة!")
                 except: pass
             else:
-                await update.message.reply_text("❌ لم يتم العثور على المستخدم.")
+                await update.message.reply_text("❌ لم يتم العثور على المستخدم في قاعدة البيانات.")
             conn.close()
         except:
             await update.message.reply_text("❌ خطأ في التنسيق. أرسل: ID المبلغ")
         context.user_data['state'] = None
 
     elif state == 'awaiting_subdomain':
+        # تنظيف اسم النطاق من المسافات والأحرف غير المسموحة
+        clean_subdomain = "".join(c for c in text if c.isalnum()).lower()
+        if not clean_subdomain:
+            await update.message.reply_text("❌ اسم النطاق غير صالح. استخدم أحرف وأرقام إنجليزية فقط:")
+            return
+
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute("SELECT id FROM rentals WHERE subdomain = ?", (text,))
+        c.execute("SELECT id FROM rentals WHERE subdomain = ?", (clean_subdomain,))
         if c.fetchone():
-            await update.message.reply_text("❌ هذا النطاق محجوز. اختر اسماً آخر:")
+            await update.message.reply_text(f"❌ النطاق '{clean_subdomain}' محجوز. اختر اسماً آخر:")
         else:
-            context.user_data['subdomain'] = text
+            context.user_data['subdomain'] = clean_subdomain
             context.user_data['state'] = 'awaiting_html'
-            await update.message.reply_text(f"✅ النطاق {text} متاح!\nالآن أرسل كود HTML كنص أو قم برفع ملف .html:")
+            await update.message.reply_text(f"✅ النطاق '{clean_subdomain}' متاح!\nالآن قم برفع ملف الـ HTML الخاص بك أو أرسل الكود نصياً:")
         conn.close()
 
     elif state == 'awaiting_html':
@@ -189,7 +202,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("يوم (10$)", callback_data='period_day')],
             [InlineKeyboardButton("شهر (200$)", callback_data='period_month')]
         ]
-        await update.message.reply_text("✅ تم استلام الكود! اختر مدة التأجير:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text("✅ تم استلام الكود نصياً! اختر مدة التأجير:", reply_markup=InlineKeyboardMarkup(keyboard))
         context.user_data['state'] = 'awaiting_period'
 
 async def period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -208,7 +221,7 @@ async def period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance, u_id = user_data[0], user_data[1]
     
     if balance < price:
-        await query.edit_message_text(f"❌ رصيدك غير كافٍ. السعر: {price}$ ورصيدك: {balance}$\nتواصل مع الإدارة لشحن الرصيد.")
+        await query.edit_message_text(f"❌ رصيدك غير كافٍ.\nالسعر المطلوب: {price}$\nرصيدك الحالي: {balance}$\nيرجى التواصل مع الإدارة لشحن الرصيد.")
         conn.close()
         return
 
@@ -226,9 +239,9 @@ async def period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   (u_id, subdomain, html, end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active'))
         conn.commit()
         url = f"{BASE_URL}/s/{subdomain}"
-        await query.edit_message_text(f"✅ تم التفعيل بنجاح!\n🔗 الرابط: {url}\n📅 ينتهي في: {end_date.strftime('%Y-%m-%d %H:%M')}")
+        await query.edit_message_text(f"✅ تم تفعيل موقعك بنجاح!\n🔗 الرابط: {url}\n📅 ينتهي في: {end_date.strftime('%Y-%m-%d %H:%M')}")
     except Exception as e:
-        await query.edit_message_text(f"❌ حدث خطأ: {str(e)}")
+        await query.edit_message_text(f"❌ حدث خطأ أثناء التفعيل: {str(e)}")
     conn.close()
 
 if __name__ == '__main__':
