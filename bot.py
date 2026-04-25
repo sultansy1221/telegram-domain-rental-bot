@@ -1,8 +1,8 @@
 import logging
 import sqlite3
 import os
-from datetime import datetime, timedelta
-from flask import Flask, request, make_response
+from datetime import datetime
+from flask import Flask, request, make_response, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import threading
@@ -22,14 +22,10 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (id INTEGER PRIMARY KEY, telegram_id INTEGER UNIQUE, username TEXT, balance REAL DEFAULT 0, is_admin INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS orders 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, details TEXT, status TEXT, created_at TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS rentals 
                  (id INTEGER PRIMARY KEY, user_id INTEGER, subdomain TEXT UNIQUE, html_content TEXT, end_date TEXT, status TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS settings 
-                 (key TEXT PRIMARY KEY, value TEXT)''')
-    
-    c.execute("INSERT OR IGNORE INTO settings VALUES ('price_hour', '1.0')")
-    c.execute("INSERT OR IGNORE INTO settings VALUES ('price_day', '10.0')")
-    c.execute("INSERT OR IGNORE INTO settings VALUES ('price_month', '200.0')")
     
     c.execute("INSERT OR IGNORE INTO users (telegram_id, username, is_admin) VALUES (?, ?, ?)", (ADMIN_ID, 'Admin', 1))
     conn.commit()
@@ -39,6 +35,53 @@ init_db()
 
 # --- خادم الويب (Flask) ---
 app = Flask(__name__)
+
+# نقطة نهاية لاستقبال الطلبات من ملف HTML (Webhook)
+@app.route('/api/order', methods=['POST'])
+def receive_order():
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data received"}), 400
+    
+    # استخراج البيانات من الطلب
+    order_id = data.get('order_id', 'N/A')
+    amount = data.get('amount', '0')
+    details = data.get('details', 'No details')
+    user_info = data.get('user_info', 'Unknown User')
+    
+    # إرسال إشعار للأدمن مع أزرار
+    message_text = (
+        f"🔔 **طلب جديد وارد!**\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🆔 رقم الطلب: `{order_id}`\n"
+        f"👤 المستخدم: {user_info}\n"
+        f"💰 المبلغ: {amount}\n"
+        f"📝 التفاصيل: {details}\n"
+        f"⏰ الوقت: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ موافقة", callback_data=f"approve_{order_id}"),
+            InlineKeyboardButton("❌ رفض", callback_data=f"reject_{order_id}")
+        ]
+    ]
+    
+    # سنستخدم خيط منفصل لإرسال الرسالة لتجنب تأخير الرد على الـ API
+    def notify_admin():
+        import requests
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        payload = {
+            "chat_id": ADMIN_ID,
+            "text": message_text,
+            "parse_mode": "Markdown",
+            "reply_markup": {"inline_keyboard": keyboard}
+        }
+        requests.post(url, json=payload)
+
+    threading.Thread(target=notify_admin).start()
+    
+    return jsonify({"status": "success", "message": "Order received and admin notified"}), 200
 
 @app.route('/s/<subdomain>')
 def serve_subdomain(subdomain):
@@ -60,7 +103,7 @@ def serve_subdomain(subdomain):
 
 @app.route('/')
 def index():
-    return "<h1>Bot is active and serving domains!</h1>"
+    return "<h1>Bot Monitor is Active!</h1>"
 
 def run_flask():
     port = int(os.environ.get('PORT', 5000))
@@ -71,188 +114,55 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    username = update.effective_user.username or "User"
-    
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (telegram_id, username) VALUES (?, ?)", (user_id, username))
-    conn.commit()
-    conn.close()
-
-    keyboard = [
-        [InlineKeyboardButton("🌐 تأجير نطاق جديد", callback_data='rent_new')],
-        [InlineKeyboardButton("👤 حسابي", callback_data='my_account')],
-    ]
     if user_id == ADMIN_ID:
-        keyboard.append([InlineKeyboardButton("⚙️ لوحة التحكم (أدمن)", callback_data='admin_panel')])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"مرحباً {username}! في بوت تأجير النطاقات.\nيمكنك الآن إرسال كود HTML كنص أو رفع ملف .html مباشرة.", reply_markup=reply_markup)
+        await update.message.reply_text("مرحباً أيها المسؤول. أنا الآن أراقب الطلبات الواردة من ملف HTML الخاص بك.")
+    else:
+        await update.message.reply_text("مرحباً بك في بوت المراقبة. سيتم إرسال طلباتك للمسؤول للمراجعة.")
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-
-    if query.data == 'rent_new':
-        await query.edit_message_text("أرسل اسم النطاق المطلوب (أحرف إنجليزية فقط):")
-        context.user_data['state'] = 'awaiting_subdomain'
     
-    elif query.data == 'my_account':
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("SELECT balance FROM users WHERE telegram_id = ?", (user_id,))
-        balance = c.fetchone()[0]
-        c.execute("SELECT subdomain, end_date FROM rentals WHERE user_id = (SELECT id FROM users WHERE telegram_id = ?)", (user_id,))
-        rentals = c.fetchall()
-        conn.close()
-        
-        msg = f"👤 حسابك:\n💰 الرصيد الحالي: {balance}$\n\nنطاقاتك النشطة:\n"
-        if not rentals:
-            msg += "لا يوجد لديك نطاقات حالياً."
-        for r in rentals:
-            msg += f"- {BASE_URL}/s/{r[0]} (ينتهي: {r[1]})\n"
-        await query.edit_message_text(msg)
-
-    elif query.data == 'admin_panel' and user_id == ADMIN_ID:
-        keyboard = [
-            [InlineKeyboardButton("➕ إضافة رصيد لمستخدم", callback_data='admin_add_balance')],
-            [InlineKeyboardButton("📊 إحصائيات عامة", callback_data='admin_stats')]
-        ]
-        await query.edit_message_text("لوحة تحكم المسؤول:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif query.data == 'admin_add_balance' and user_id == ADMIN_ID:
-        await query.edit_message_text("أرسل ID المستخدم متبوعاً بالمبلغ، مثال:\n`12345678 50`")
-        context.user_data['state'] = 'admin_adding_balance'
+    data = query.data
+    action, order_id = data.split('_')
+    
+    if action == "approve":
+        status_text = "✅ تم الموافقة على الطلب بنجاح."
+        # هنا يمكنك إضافة كود لإرسال رسالة للمستخدم أو تحديث قاعدة البيانات
+    else:
+        status_text = "❌ تم رفض الطلب."
+    
+    await query.edit_message_text(text=f"{query.message.text}\n\n━━━━━━━━━━━━━━\n{status_text}")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get('state')
-    if state == 'awaiting_html':
-        doc = update.message.document
-        # التعرف التلقائي على ملفات HTML أو النصية
-        if doc.file_name.lower().endswith(('.html', '.htm', '.txt')):
-            file = await context.bot.get_file(doc.file_id)
-            # تحميل الملف وقراءته
-            file_content = await file.download_as_bytearray()
-            try:
-                html_text = file_content.decode('utf-8')
-            except UnicodeDecodeError:
-                # محاولة فك التشفير بتنسيقات أخرى إذا فشل utf-8
-                html_text = file_content.decode('latin-1')
-            
-            context.user_data['html'] = html_text
-            keyboard = [
-                [InlineKeyboardButton("ساعة (1$)", callback_data='period_hour')],
-                [InlineKeyboardButton("يوم (10$)", callback_data='period_day')],
-                [InlineKeyboardButton("شهر (200$)", callback_data='period_month')]
-            ]
-            await update.message.reply_text(f"✅ تم التعرف على الملف '{doc.file_name}' بنجاح!\nاختر مدة التأجير:", reply_markup=InlineKeyboardMarkup(keyboard))
-            context.user_data['state'] = 'awaiting_period'
-        else:
-            await update.message.reply_text("❌ عذراً، يجب أن يكون الملف بصيغة .html لكي أتمكن من تشغيله.")
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get('state')
+    # ميزة رفع الملفات السابقة (للتأجير)
     user_id = update.effective_user.id
-    text = update.message.text
-
-    if state == 'admin_adding_balance' and user_id == ADMIN_ID:
-        try:
-            parts = text.split()
-            target_id = parts[0]
-            amount = float(parts[1])
-            conn = sqlite3.connect(DB_NAME)
-            c = conn.cursor()
-            c.execute("UPDATE users SET balance = balance + ? WHERE telegram_id = ?", (amount, target_id))
-            if c.rowcount > 0:
-                conn.commit()
-                await update.message.reply_text(f"✅ تم إضافة {amount}$ لحساب المستخدم {target_id}")
-                try:
-                    await context.bot.send_message(chat_id=int(target_id), text=f"💰 تم إضافة {amount}$ إلى رصيدك من قبل الإدارة!")
-                except: pass
-            else:
-                await update.message.reply_text("❌ لم يتم العثور على المستخدم في قاعدة البيانات.")
-            conn.close()
-        except:
-            await update.message.reply_text("❌ خطأ في التنسيق. أرسل: ID المبلغ")
-        context.user_data['state'] = None
-
-    elif state == 'awaiting_subdomain':
-        # تنظيف اسم النطاق من المسافات والأحرف غير المسموحة
-        clean_subdomain = "".join(c for c in text if c.isalnum()).lower()
-        if not clean_subdomain:
-            await update.message.reply_text("❌ اسم النطاق غير صالح. استخدم أحرف وأرقام إنجليزية فقط:")
-            return
-
+    doc = update.message.document
+    if doc.file_name.lower().endswith(('.html', '.htm')):
+        file = await context.bot.get_file(doc.file_id)
+        file_content = await file.download_as_bytearray()
+        html_text = file_content.decode('utf-8', errors='ignore')
+        
+        # تخزين الملف كـ "نطاق فرعي" للمستخدم (لأغراض العرض)
+        subdomain = f"user_{user_id}_{int(datetime.now().timestamp())}"
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute("SELECT id FROM rentals WHERE subdomain = ?", (clean_subdomain,))
-        if c.fetchone():
-            await update.message.reply_text(f"❌ النطاق '{clean_subdomain}' محجوز. اختر اسماً آخر:")
-        else:
-            context.user_data['subdomain'] = clean_subdomain
-            context.user_data['state'] = 'awaiting_html'
-            await update.message.reply_text(f"✅ النطاق '{clean_subdomain}' متاح!\nالآن قم برفع ملف الـ HTML الخاص بك أو أرسل الكود نصياً:")
-        conn.close()
-
-    elif state == 'awaiting_html':
-        context.user_data['html'] = text
-        keyboard = [
-            [InlineKeyboardButton("ساعة (1$)", callback_data='period_hour')],
-            [InlineKeyboardButton("يوم (10$)", callback_data='period_day')],
-            [InlineKeyboardButton("شهر (200$)", callback_data='period_month')]
-        ]
-        await update.message.reply_text("✅ تم استلام الكود نصياً! اختر مدة التأجير:", reply_markup=InlineKeyboardMarkup(keyboard))
-        context.user_data['state'] = 'awaiting_period'
-
-async def period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    period_type = query.data.split('_')[1]
-    
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key = ?", (f'price_{period_type}',))
-    price = float(c.fetchone()[0])
-    
-    c.execute("SELECT balance, id FROM users WHERE telegram_id = ?", (user_id,))
-    user_data = c.fetchone()
-    balance, u_id = user_data[0], user_data[1]
-    
-    if balance < price:
-        await query.edit_message_text(f"❌ رصيدك غير كافٍ.\nالسعر المطلوب: {price}$\nرصيدك الحالي: {balance}$\nيرجى التواصل مع الإدارة لشحن الرصيد.")
-        conn.close()
-        return
-
-    subdomain = context.user_data.get('subdomain')
-    html = context.user_data.get('html')
-    
-    now = datetime.now()
-    if period_type == 'hour': end_date = now + timedelta(hours=1)
-    elif period_type == 'day': end_date = now + timedelta(days=1)
-    else: end_date = now + timedelta(days=30)
-    
-    try:
-        c.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (price, u_id))
+        end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
         c.execute("INSERT INTO rentals (user_id, subdomain, html_content, end_date, status) VALUES (?, ?, ?, ?, ?)",
-                  (u_id, subdomain, html, end_date.strftime('%Y-%m-%d %H:%M:%S'), 'active'))
+                  (user_id, subdomain, html_text, end_date, 'active'))
         conn.commit()
+        conn.close()
+        
         url = f"{BASE_URL}/s/{subdomain}"
-        await query.edit_message_text(f"✅ تم تفعيل موقعك بنجاح!\n🔗 الرابط: {url}\n📅 ينتهي في: {end_date.strftime('%Y-%m-%d %H:%M')}")
-    except Exception as e:
-        await query.edit_message_text(f"❌ حدث خطأ أثناء التفعيل: {str(e)}")
-    conn.close()
+        await update.message.reply_text(f"✅ تم رفع الملف وتشغيله!\n🔗 الرابط: {url}")
 
 if __name__ == '__main__':
     threading.Thread(target=run_flask, daemon=True).start()
     
     app_bot = ApplicationBuilder().token(TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start))
-    app_bot.add_handler(CallbackQueryHandler(button_handler, pattern='^(rent_new|my_account|admin_panel|admin_add_balance)$'))
-    app_bot.add_handler(CallbackQueryHandler(period_selection, pattern='^period_'))
+    app_bot.add_handler(CallbackQueryHandler(callback_handler))
     app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app_bot.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
     
-    print("Bot is running...")
+    print("Bot Monitor is running...")
     app_bot.run_polling()
